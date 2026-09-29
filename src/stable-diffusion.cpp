@@ -3145,7 +3145,7 @@ public:
     }
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
-        if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
+        if (sd_version_is_pid(version) || sd_version_is_minit2i(version) || sd_version_is_sensenova_u1(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
         }
         auto latents                      = first_stage_model->diffusion_to_vae_latents(x);

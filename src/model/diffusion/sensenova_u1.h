@@ -40,7 +40,7 @@ namespace SenseNovaU1 {
         float rope_theta_hw                  = 10000.f;
         float noise_scale_base_image_seq_len = 64.f;
         float noise_scale_max_value          = 16.f;
-        float t_eps                          = 0.02f;
+        float t_eps                          = 0.05f;
         bool add_noise_scale_embedding       = true;
 
         int64_t image_token_stride() const {
@@ -576,8 +576,10 @@ namespace SenseNovaU1 {
 
         explicit SenseNovaU1Model(const SenseNovaU1Config& config, bool generation_only = false)
             : config(config) {
-            blocks["language_model.model"]                       = std::make_shared<TextModel>(config, generation_only);
-            blocks["vision_model.embeddings"]                    = std::make_shared<VisionEmbeddings>(config);
+            blocks["language_model.model"] = std::make_shared<TextModel>(config, generation_only);
+            if (!generation_only) {
+                blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config);
+            }
             blocks["fm_modules.vision_model_mot_gen.embeddings"] = std::make_shared<VisionEmbeddings>(config);
             blocks["fm_modules.timestep_embedder"]               = std::make_shared<TimestepEmbedder>(config.hidden_size,
                                                                                                       config.timestep_embedding_size);
@@ -767,6 +769,10 @@ namespace SenseNovaU1 {
                 image.shape()[1] % config.image_token_stride()) {
                 return {};
             }
+            auto understanding_vision = model.understanding_vision_embeddings();
+            if (!understanding_vision) {
+                return {};
+            }
             const int64_t grid_w = image.shape()[0] / config.patch_size;
             const int64_t grid_h = image.shape()[1] / config.patch_size;
             vision_position_h_vec.resize(grid_w * grid_h);
@@ -781,10 +787,10 @@ namespace SenseNovaU1 {
                 auto position_x = make_position_tensor(vision_position_w_vec, "snu15.understanding.position_x");
                 auto position_y = make_position_tensor(vision_position_h_vec, "snu15.understanding.position_y");
                 auto runner_ctx = get_context();
-                auto hidden = model.understanding_vision_embeddings()->forward(&runner_ctx,
-                                                                                image_input,
-                                                                                position_x,
-                                                                                position_y);
+                auto hidden = understanding_vision->forward(&runner_ctx,
+                                                             image_input,
+                                                             position_x,
+                                                             position_y);
                 ggml_build_forward_expand(graph, hidden);
                 return graph;
             };
