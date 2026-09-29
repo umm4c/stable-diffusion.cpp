@@ -2890,6 +2890,7 @@ public:
             // external slot still represents a valid denoising branch.
             const bool has_uncond_condition = !uncond.empty() ||
                                               (sd_version_is_bagel(version) &&
+                                               cfg_scale > 1.f &&
                                                external_kv_conditions[1].active);
             if (has_uncond_condition && (!sd_version_is_bagel(version) || sigma > 0.4f)) {
                 if (!step_cache.is_step_skipped()) {
@@ -2916,6 +2917,7 @@ public:
             }
             const bool has_img_uncond_condition = !img_uncond.empty() ||
                                                   (sd_version_is_bagel(version) &&
+                                                   cfg_scale > 1.f && img_cfg_scale > 1.f &&
                                                    external_kv_conditions[2].active);
             if (has_img_uncond_condition && (!sd_version_is_bagel(version) || sigma > 0.4f)) {
                 img_uncond_out = run_condition(img_uncond,
