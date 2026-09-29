@@ -333,6 +333,7 @@ namespace LLM {
         int64_t hidden_size;
         float eps;
         bool add_unit_offset;
+        bool force_f32;
         std::string prefix;
 
         void init_params(ggml_context* ctx,
@@ -345,13 +346,17 @@ namespace LLM {
     public:
         LLMRMSNorm(int64_t hidden_size,
                    float eps            = 1e-06f,
-                   bool add_unit_offset = false)
-            : hidden_size(hidden_size), eps(eps), add_unit_offset(add_unit_offset) {}
+                   bool add_unit_offset = false,
+                   bool force_f32       = false)
+            : hidden_size(hidden_size), eps(eps), add_unit_offset(add_unit_offset), force_f32(force_f32) {}
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             ggml_tensor* w = params["weight"];
             if (ctx->weight_adapter) {
                 w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
+            }
+            if (force_f32 && x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
             }
             x           = ggml_rms_norm(ctx->ggml_ctx, x, eps);
             auto scaled = ggml_mul(ctx->ggml_ctx, x, w);
@@ -370,11 +375,12 @@ namespace LLM {
         MLP(int64_t hidden_size,
             int64_t intermediate_size,
             bool bias                 = false,
-            MLPActivation activation_ = MLPActivation::SILU)
+            MLPActivation activation_ = MLPActivation::SILU,
+            ggml_type output_type     = GGML_TYPE_F32)
             : activation(activation_) {
-            blocks["gate_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, intermediate_size, bias));
-            blocks["up_proj"]   = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, intermediate_size, bias));
-            blocks["down_proj"] = std::shared_ptr<GGMLBlock>(new Linear(intermediate_size, hidden_size, bias));
+            blocks["gate_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, intermediate_size, bias, false, false, 1.f, output_type));
+            blocks["up_proj"]   = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, intermediate_size, bias, false, false, 1.f, output_type));
+            blocks["down_proj"] = std::shared_ptr<GGMLBlock>(new Linear(intermediate_size, hidden_size, bias, false, false, 1.f, output_type));
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {

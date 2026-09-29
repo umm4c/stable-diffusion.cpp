@@ -673,7 +673,8 @@ struct LoraModel : public GGMLRunner {
                 }
                 scale_value *= multiplier;
 
-                auto curr_out_diff = ggml_ext_lokr_forward(ctx, backend, x, lokr_w1, lokr_w1_a, lokr_w1_b, lokr_w2, lokr_w2_a, lokr_w2_b, is_conv2d, forward_params.conv2d, scale_value);
+                const ggml_type output_type = is_conv2d ? forward_params.conv2d.output_type : forward_params.linear.output_type;
+                auto curr_out_diff = ggml_ext_lokr_forward(ctx, backend, x, lokr_w1, lokr_w1_a, lokr_w1_b, lokr_w2, lokr_w2_a, lokr_w2_b, is_conv2d, forward_params.conv2d, scale_value, output_type);
                 if (out_diff == nullptr) {
                     out_diff = curr_out_diff;
                 } else {
@@ -806,11 +807,11 @@ struct LoraModel : public GGMLRunner {
 
             ggml_tensor* lx;
             if (!is_conv2d) {
-                lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale, forward_params.linear.output_type);
                 if (lora_mid) {
-                    lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                    lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale, forward_params.linear.output_type);
                 }
-                lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+                lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale, forward_params.linear.output_type);
             } else {  // OP_CONV2D
                 lx = ggml_ext_conv_2d(ctx,
                                       x,
@@ -825,7 +826,8 @@ struct LoraModel : public GGMLRunner {
                                       forward_params.conv2d.direct,
                                       forward_params.conv2d.circular_x,
                                       forward_params.conv2d.circular_y,
-                                      forward_params.conv2d.scale);
+                                      forward_params.conv2d.scale,
+                                      forward_params.conv2d.output_type);
                 if (lora_mid) {
                     lx = ggml_ext_conv_2d(ctx,
                                           lx,
@@ -840,7 +842,8 @@ struct LoraModel : public GGMLRunner {
                                           forward_params.conv2d.direct,
                                           forward_params.conv2d.circular_x,
                                           forward_params.conv2d.circular_y,
-                                          forward_params.conv2d.scale);
+                                          forward_params.conv2d.scale,
+                                          forward_params.conv2d.output_type);
                 }
                 lx = ggml_ext_conv_2d(ctx,
                                       lx,
@@ -855,7 +858,8 @@ struct LoraModel : public GGMLRunner {
                                       forward_params.conv2d.direct,
                                       forward_params.conv2d.circular_x,
                                       forward_params.conv2d.circular_y,
-                                      forward_params.conv2d.scale);
+                                      forward_params.conv2d.scale,
+                                      forward_params.conv2d.output_type);
             }
 
             auto curr_out_diff = ggml_ext_scale(ctx, lx, scale_value, true);
@@ -1045,7 +1049,7 @@ public:
         }
         ggml_tensor* out;
         if (forward_params.op_type == ForwardParams::op_type_t::OP_LINEAR) {
-            out = ggml_ext_linear(ctx, x, w, b, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+            out = ggml_ext_linear(ctx, x, w, b, forward_params.linear.force_prec_f32, forward_params.linear.scale, forward_params.linear.output_type);
         } else {  // OP_CONV2D
             out = ggml_ext_conv_2d(ctx,
                                    x,
@@ -1060,7 +1064,8 @@ public:
                                    forward_params.conv2d.direct,
                                    forward_params.conv2d.circular_x,
                                    forward_params.conv2d.circular_y,
-                                   forward_params.conv2d.scale);
+                                   forward_params.conv2d.scale,
+                                   forward_params.conv2d.output_type);
         }
         for (auto& lora_model : lora_models) {
             ggml_tensor* out_diff = lora_model->get_out_diff(ctx, backend, x, w, forward_params, prefix + "weight");
@@ -1088,7 +1093,8 @@ public:
                                                         weight_diff,
                                                         nullptr,
                                                         forward_params.linear.force_prec_f32,
-                                                        forward_params.linear.scale);
+                                                        forward_params.linear.scale,
+                                                        forward_params.linear.output_type);
                 output                = ggml_add_inplace(ctx, output, out_diff);
             }
 

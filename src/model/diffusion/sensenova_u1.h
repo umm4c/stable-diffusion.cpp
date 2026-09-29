@@ -42,13 +42,15 @@ namespace SenseNovaU1 {
         float noise_scale_max_value          = 16.f;
         float t_eps                          = 0.05f;
         bool add_noise_scale_embedding       = true;
+        ggml_type generation_compute_type     = GGML_TYPE_F32;
 
         int64_t image_token_stride() const {
             return patch_size * vision_downsample_factor;
         }
 
         static SenseNovaU1Config detect_from_weights(const String2TensorStorage& tensor_storage_map,
-                                                     const std::string& prefix) {
+                                                     const std::string& prefix,
+                                                     ggml_backend_t backend) {
             SenseNovaU1Config config;
             config.num_layers      = 0;
             const std::string root = prefix.empty() ? "" : prefix + ".";
@@ -70,6 +72,10 @@ namespace SenseNovaU1 {
                     config.patch_size         = tensor_storage.ne[0];
                     config.in_channels        = tensor_storage.ne[2];
                     config.vision_hidden_size = tensor_storage.ne[3];
+                    const ggml_type storage_type = tensor_storage.expected_type != GGML_TYPE_COUNT
+                                                       ? tensor_storage.expected_type
+                                                       : tensor_storage.type;
+                    config.generation_compute_type = storage_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
                 } else if (ends_with(name, "fm_modules.vision_model_mot_gen.embeddings.dense_embedding.weight") && tensor_storage.n_dims == 4) {
                     config.vision_downsample_factor = tensor_storage.ne[0];
                 }
@@ -85,15 +91,20 @@ namespace SenseNovaU1 {
                 config.num_layers = 42;
             }
             config.add_noise_scale_embedding = tensor_storage_map.find(root + "fm_modules.noise_scale_embedder.mlp.0.weight") != tensor_storage_map.end();
+            const std::string backend_name = backend != nullptr ? ggml_backend_name(backend) : "";
+            if (!starts_with(backend_name, "CANN")) {
+                config.generation_compute_type = GGML_TYPE_F32;
+            }
 
-            LOG_DEBUG("sensenova-u1.5: layers=%" PRId64 ", hidden=%" PRId64 ", intermediate=%" PRId64 ", heads=%" PRId64 ", kv_heads=%" PRId64 ", patch=%" PRId64 "x%" PRId64,
+            LOG_DEBUG("sensenova-u1.5: layers=%" PRId64 ", hidden=%" PRId64 ", intermediate=%" PRId64 ", heads=%" PRId64 ", kv_heads=%" PRId64 ", patch=%" PRId64 "x%" PRId64 ", generation_compute=%s",
                       config.num_layers,
                       config.hidden_size,
                       config.intermediate_size,
                       config.num_heads,
                       config.num_kv_heads,
                       config.patch_size,
-                      config.vision_downsample_factor);
+                      config.vision_downsample_factor,
+                      ggml_type_name(config.generation_compute_type));
             return config;
         }
     };
@@ -112,7 +123,9 @@ namespace SenseNovaU1 {
                                                   in_channels,
                                                   out_channels);
             if (bias) {
-                params["bias"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_channels);
+                params["bias"] = ggml_new_tensor_1d(ctx,
+                                                     get_type(prefix + "bias", tensor_storage_map, output_type),
+                                                     out_channels);
             }
         }
 
@@ -122,23 +135,27 @@ namespace SenseNovaU1 {
                       std::pair<int, int> kernel_size,
                       std::pair<int, int> stride  = {1, 1},
                       std::pair<int, int> padding = {0, 0},
-                      bool bias                   = true)
+                      bool bias                   = true,
+                      ggml_type output_type       = GGML_TYPE_F32)
             : Conv2d(in_channels,
                      out_channels,
                      kernel_size,
                      stride,
                      padding,
                      {1, 1},
-                     bias) {}
+                     bias,
+                     output_type) {}
     };
 
     struct TimestepEmbedder : public GGMLBlock {
         int64_t frequency_embedding_size;
 
-        TimestepEmbedder(int64_t hidden_size, int64_t frequency_embedding_size = 256)
+        TimestepEmbedder(int64_t hidden_size,
+                         int64_t frequency_embedding_size = 256,
+                         ggml_type output_type = GGML_TYPE_F32)
             : frequency_embedding_size(frequency_embedding_size) {
-            blocks["mlp.0"] = std::make_shared<Linear>(frequency_embedding_size, hidden_size, true);
-            blocks["mlp.2"] = std::make_shared<Linear>(hidden_size, hidden_size, true);
+            blocks["mlp.0"] = std::make_shared<Linear>(frequency_embedding_size, hidden_size, true, false, false, 1.f, output_type);
+            blocks["mlp.2"] = std::make_shared<Linear>(hidden_size, hidden_size, true, false, false, 1.f, output_type);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* timesteps) {
@@ -162,6 +179,9 @@ namespace SenseNovaU1 {
                                           float theta,
                                           int max_position) {
         GGML_ASSERT(x->ne[0] % 2 == 0);
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+        }
         // ggml_rope_ext addresses positions through ne[2]. The vision
         // embeddings arrive as [hidden, tokens, batch], so add the singleton
         // head axis used by the RoPE kernel: [hidden, 1, tokens, batch].
@@ -200,21 +220,25 @@ namespace SenseNovaU1 {
 
     struct VisionEmbeddings : public GGMLBlock {
         SenseNovaU1Config config;
+        ggml_type output_type;
 
-        explicit VisionEmbeddings(const SenseNovaU1Config& config)
-            : config(config) {
+        explicit VisionEmbeddings(const SenseNovaU1Config& config,
+                                  ggml_type output_type = GGML_TYPE_F32)
+            : config(config), output_type(output_type) {
             blocks["patch_embedding"] = std::make_shared<StorageConv2d>(config.in_channels,
                                                                         config.vision_hidden_size,
                                                                         std::pair<int, int>{static_cast<int>(config.patch_size), static_cast<int>(config.patch_size)},
                                                                         std::pair<int, int>{static_cast<int>(config.patch_size), static_cast<int>(config.patch_size)},
                                                                         std::pair<int, int>{0, 0},
-                                                                        true);
+                                                                        true,
+                                                                        output_type);
             blocks["dense_embedding"] = std::make_shared<StorageConv2d>(config.vision_hidden_size,
                                                                         config.hidden_size,
                                                                         std::pair<int, int>{static_cast<int>(config.vision_downsample_factor), static_cast<int>(config.vision_downsample_factor)},
                                                                         std::pair<int, int>{static_cast<int>(config.vision_downsample_factor), static_cast<int>(config.vision_downsample_factor)},
                                                                         std::pair<int, int>{0, 0},
-                                                                        true);
+                                                                        true,
+                                                                        output_type);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -238,6 +262,9 @@ namespace SenseNovaU1 {
                                                      position_y,
                                                      config.rope_theta_hw,
                                                      static_cast<int>(config.max_position_embeddings_hw));
+            if (x->type != output_type) {
+                x = ggml_cast(ctx->ggml_ctx, x, output_type);
+            }
             x                    = ggml_reshape_4d(ctx->ggml_ctx, x, config.vision_hidden_size, grid_w, grid_h, batch);
             x                    = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 2, 0, 1, 3));
             x                    = dense_embedding->forward(ctx, x);
@@ -269,13 +296,15 @@ namespace SenseNovaU1 {
                                                               std::pair<int, int>{3, 3},
                                                               std::pair<int, int>{1, 1},
                                                               std::pair<int, int>{1, 1},
-                                                              true);
+                                                              true,
+                                                              config.generation_compute_type);
             blocks["conv2"] = std::make_shared<StorageConv2d>(256,
                                                               192,
                                                               std::pair<int, int>{3, 3},
                                                               std::pair<int, int>{1, 1},
                                                               std::pair<int, int>{1, 1},
-                                                              true);
+                                                              true,
+                                                              config.generation_compute_type);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -307,11 +336,10 @@ namespace SenseNovaU1 {
                 blocks["v_proj"]         = std::make_shared<Linear>(config.hidden_size, config.num_kv_heads * config.head_dim, false);
                 blocks["o_proj"]         = std::make_shared<Linear>(config.num_heads * config.head_dim, config.hidden_size, false);
             }
-            blocks["q_proj_mot_gen"] = std::make_shared<Linear>(config.hidden_size, config.num_heads * config.head_dim, false);
-            blocks["k_proj_mot_gen"] = std::make_shared<Linear>(config.hidden_size, config.num_kv_heads * config.head_dim, false);
-            blocks["v_proj_mot_gen"] = std::make_shared<Linear>(config.hidden_size, config.num_kv_heads * config.head_dim, false);
-            blocks["o_proj_mot_gen"] = std::make_shared<Linear>(config.num_heads * config.head_dim, config.hidden_size, false);
-
+            blocks["q_proj_mot_gen"] = std::make_shared<Linear>(config.hidden_size, config.num_heads * config.head_dim, false, false, false, 1.f, config.generation_compute_type);
+            blocks["k_proj_mot_gen"] = std::make_shared<Linear>(config.hidden_size, config.num_kv_heads * config.head_dim, false, false, false, 1.f, config.generation_compute_type);
+            blocks["v_proj_mot_gen"] = std::make_shared<Linear>(config.hidden_size, config.num_kv_heads * config.head_dim, false, false, false, 1.f, config.generation_compute_type);
+            blocks["o_proj_mot_gen"] = std::make_shared<Linear>(config.num_heads * config.head_dim, config.hidden_size, false, false, false, 1.f, config.generation_compute_type);
             const int64_t axis_dim      = config.head_dim / 2;
             if (!generation_only) {
                 blocks["q_norm"]            = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
@@ -319,10 +347,10 @@ namespace SenseNovaU1 {
                 blocks["q_norm_hw"]         = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
                 blocks["k_norm_hw"]         = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
             }
-            blocks["q_norm_mot_gen"]    = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
-            blocks["k_norm_mot_gen"]    = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
-            blocks["q_norm_hw_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
-            blocks["k_norm_hw_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps);
+            blocks["q_norm_mot_gen"]    = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps, false, true);
+            blocks["k_norm_mot_gen"]    = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps, false, true);
+            blocks["q_norm_hw_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps, false, true);
+            blocks["k_norm_hw_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(axis_dim, config.rms_norm_eps, false, true);
         }
 
         ggml_tensor* apply_axis_rope(GGMLRunnerContext* ctx,
@@ -438,12 +466,22 @@ namespace SenseNovaU1 {
                                      position_w,
                                      "k_norm" + suffix,
                                      "k_norm_hw" + suffix);
+            if (generation && config.generation_compute_type == GGML_TYPE_F16) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F16);
+                k = ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_F16);
+            }
 
             const std::string layer_cache = cache_prefix + "." + std::to_string(layer_index);
             if (generation) {
                 auto prefix_k = ctx->load_cache_tensor(layer_cache + ".k");
                 auto prefix_v = ctx->load_cache_tensor(layer_cache + ".v");
                 GGML_ASSERT(prefix_k != nullptr && prefix_v != nullptr);
+                if (prefix_k->type != config.generation_compute_type) {
+                    prefix_k = ggml_cast(ctx->ggml_ctx, prefix_k, config.generation_compute_type);
+                }
+                if (prefix_v->type != config.generation_compute_type) {
+                    prefix_v = ggml_cast(ctx->ggml_ctx, prefix_v, config.generation_compute_type);
+                }
                 k = ggml_concat(ctx->ggml_ctx, prefix_k, k, 2);
                 v = ggml_concat(ctx->ggml_ctx, prefix_v, v, 2);
             } else {
@@ -474,7 +512,9 @@ namespace SenseNovaU1 {
                                               config.num_heads,
                                               attention_mask,
                                               true,
-                                              ctx->flash_attn_enabled);
+                                              ctx->flash_attn_enabled,
+                                              1.0f,
+                                              generation ? config.generation_compute_type : GGML_TYPE_F32);
             return o_proj->forward(ctx, out);
         }
     };
@@ -482,9 +522,9 @@ namespace SenseNovaU1 {
     struct TransformerBlock : public GGMLBlock {
         TransformerBlock(const SenseNovaU1Config& config, int layer_index, bool generation_only = false) {
             blocks["self_attn"]                        = std::make_shared<Attention>(config, layer_index, generation_only);
-            blocks["mlp_mot_gen"]                      = std::make_shared<LLM::MLP>(config.hidden_size, config.intermediate_size, false);
-            blocks["input_layernorm_mot_gen"]          = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps);
-            blocks["post_attention_layernorm_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps);
+            blocks["mlp_mot_gen"]                      = std::make_shared<LLM::MLP>(config.hidden_size, config.intermediate_size, false, LLM::MLPActivation::SILU, config.generation_compute_type);
+            blocks["input_layernorm_mot_gen"]          = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps, false, true);
+            blocks["post_attention_layernorm_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps, false, true);
             if (!generation_only) {
                 blocks["mlp"]                              = std::make_shared<LLM::MLP>(config.hidden_size, config.intermediate_size, false);
                 blocks["input_layernorm"]                  = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps);
@@ -539,7 +579,7 @@ namespace SenseNovaU1 {
             for (int i = 0; i < config.num_layers; ++i) {
                 blocks["layers." + std::to_string(i)] = std::make_shared<TransformerBlock>(config, i, generation_only);
             }
-            blocks["norm_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps);
+            blocks["norm_mot_gen"] = std::make_shared<LLM::LLMRMSNorm>(config.hidden_size, config.rms_norm_eps, false, true);
         }
 
         ggml_tensor* embed(GGMLRunnerContext* ctx, ggml_tensor* input_ids) {
@@ -578,14 +618,16 @@ namespace SenseNovaU1 {
             : config(config) {
             blocks["language_model.model"] = std::make_shared<TextModel>(config, generation_only);
             if (!generation_only) {
-                blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config);
+                blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config, GGML_TYPE_F32);
             }
-            blocks["fm_modules.vision_model_mot_gen.embeddings"] = std::make_shared<VisionEmbeddings>(config);
+            blocks["fm_modules.vision_model_mot_gen.embeddings"] = std::make_shared<VisionEmbeddings>(config, config.generation_compute_type);
             blocks["fm_modules.timestep_embedder"]               = std::make_shared<TimestepEmbedder>(config.hidden_size,
-                                                                                                      config.timestep_embedding_size);
+                                                                                                      config.timestep_embedding_size,
+                                                                                                      config.generation_compute_type);
             if (config.add_noise_scale_embedding) {
                 blocks["fm_modules.noise_scale_embedder"] = std::make_shared<TimestepEmbedder>(config.hidden_size,
-                                                                                               config.timestep_embedding_size);
+                                                                                               config.timestep_embedding_size,
+                                                                                               config.generation_compute_type);
             }
             blocks["fm_modules.fm_head"] = std::make_shared<PixelDecoder>(config);
         }
@@ -622,6 +664,8 @@ namespace SenseNovaU1 {
         SenseNovaU1Config config;
         SenseNovaU1Model model;
         bool external_prefix;
+        bool precision_audit_logged = false;
+        bool kv_precision_logged    = false;
         std::unordered_set<uint64_t> cached_prefix_hashes;
         std::map<uint64_t, std::string> imported_prefixes;
         std::map<uint64_t, int64_t> imported_prefix_lengths;
@@ -639,7 +683,7 @@ namespace SenseNovaU1 {
                           std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
                           bool external_prefix = false)
             : DiffusionModelRunner(backend, prefix, weight_manager),
-              config(SenseNovaU1Config::detect_from_weights(tensor_storage_map, prefix)),
+              config(SenseNovaU1Config::detect_from_weights(tensor_storage_map, prefix, backend)),
               model(config, external_prefix),
               external_prefix(external_prefix) {
             model.init(params_ctx, tensor_storage_map, prefix);
@@ -734,8 +778,8 @@ namespace SenseNovaU1 {
                 auto graph = new_graph_custom(SENSENOVA_U1_GRAPH_SIZE);
                 for (size_t i = 0; i < layers; ++i) {
                     const auto name = prefix + "." + std::to_string(i);
-                    auto k = ggml_cast(compute_ctx, to_backend(keys[i]), GGML_TYPE_F32);
-                    auto v = ggml_cast(compute_ctx, to_backend(values[i]), GGML_TYPE_F32);
+                    auto k = ggml_cast(compute_ctx, to_backend(keys[i]), config.generation_compute_type);
+                    auto v = ggml_cast(compute_ctx, to_backend(values[i]), config.generation_compute_type);
                     ggml_set_output(k);
                     ggml_set_output(v);
                     cache(name + ".k", k);
@@ -747,6 +791,11 @@ namespace SenseNovaU1 {
             };
             if (!GGMLRunner::compute<float>(get_graph, n_threads, false, true, true, true).has_value()) {
                 return false;
+            }
+            if (!kv_precision_logged) {
+                LOG_INFO("SenseNova U1.5 imported KV cache precision: %s",
+                         ggml_type_name(config.generation_compute_type));
+                kv_precision_logged = true;
             }
             for (auto it = imported_prefixes.begin(); it != imported_prefixes.end();) {
                 if (it->second == prefix) {
@@ -971,6 +1020,9 @@ namespace SenseNovaU1 {
                                                 x->ne[3]);
             hidden            = ggml_cont(compute_ctx, ggml_permute(compute_ctx, hidden, 2, 0, 1, 3));
             auto x_prediction = model.pixel_decoder()->forward(&runner_ctx, hidden);
+            if (x_prediction->type != GGML_TYPE_F32) {
+                x_prediction = ggml_cast(compute_ctx, x_prediction, GGML_TYPE_F32);
+            }
 
             const float timestep = timestep_tensor.values()[0];
             const float denom    = std::max(1.f - timestep, config.t_eps);
@@ -978,6 +1030,64 @@ namespace SenseNovaU1 {
                                               ggml_sub(compute_ctx, x_prediction, x),
                                               1.f / denom);
             ggml_build_forward_expand(graph, velocity);
+            if (!precision_audit_logged) {
+                int mul_mat_f16 = 0;
+                int mul_mat_f32 = 0;
+                int im2col_f16  = 0;
+                int im2col_f32  = 0;
+                int norm_f32    = 0;
+                int softmax_f32 = 0;
+                int rope_f32    = 0;
+                int add_f16     = 0;
+                int add_f32     = 0;
+                int unary_f16   = 0;
+                int unary_f32   = 0;
+                for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                    const ggml_tensor* node = ggml_graph_node(graph, i);
+                    switch (node->op) {
+                        case GGML_OP_MUL_MAT:
+                            node->type == GGML_TYPE_F16 ? ++mul_mat_f16 : ++mul_mat_f32;
+                            break;
+                        case GGML_OP_IM2COL:
+                            node->type == GGML_TYPE_F16 ? ++im2col_f16 : ++im2col_f32;
+                            break;
+                        case GGML_OP_RMS_NORM:
+                            GGML_ASSERT(config.generation_compute_type != GGML_TYPE_F16 || node->type == GGML_TYPE_F32);
+                            norm_f32 += node->type == GGML_TYPE_F32;
+                            break;
+                        case GGML_OP_SOFT_MAX:
+                            GGML_ASSERT(config.generation_compute_type != GGML_TYPE_F16 || node->type == GGML_TYPE_F32);
+                            softmax_f32 += node->type == GGML_TYPE_F32;
+                            break;
+                        case GGML_OP_ROPE:
+                            GGML_ASSERT(config.generation_compute_type != GGML_TYPE_F16 || node->type == GGML_TYPE_F32);
+                            rope_f32 += node->type == GGML_TYPE_F32;
+                            break;
+                        case GGML_OP_ADD:
+                            node->type == GGML_TYPE_F16 ? ++add_f16 : ++add_f32;
+                            break;
+                        case GGML_OP_UNARY:
+                            node->type == GGML_TYPE_F16 ? ++unary_f16 : ++unary_f32;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                LOG_INFO("SenseNova U1.5 precision audit: mul_mat f16=%d f32=%d, im2col f16=%d f32=%d, add f16=%d f32=%d, unary f16=%d f32=%d, rms_norm f32=%d, softmax f32=%d, rope f32=%d, sampler_output=%s",
+                         mul_mat_f16,
+                         mul_mat_f32,
+                         im2col_f16,
+                         im2col_f32,
+                         add_f16,
+                         add_f32,
+                         unary_f16,
+                         unary_f32,
+                         norm_f32,
+                         softmax_f32,
+                         rope_f32,
+                         ggml_type_name(velocity->type));
+                precision_audit_logged = true;
+            }
             return graph;
         }
 
