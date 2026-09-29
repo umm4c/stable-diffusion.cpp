@@ -72,6 +72,12 @@ const char* unused_tensors[] = {
 };
 
 bool is_unused_tensor(const std::string& name) {
+    if (name == "vision_model.embeddings.patch_embedding.weight" ||
+        name == "vision_model.embeddings.patch_embedding.bias" ||
+        name == "vision_model.embeddings.dense_embedding.weight" ||
+        name == "vision_model.embeddings.dense_embedding.bias") {
+        return false;
+    }
     for (size_t i = 0; i < sizeof(unused_tensors) / sizeof(const char*); i++) {
         if (starts_with(name, unused_tensors[i])) {
             return true;

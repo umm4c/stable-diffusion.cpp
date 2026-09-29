@@ -617,9 +617,7 @@ namespace SenseNovaU1 {
         explicit SenseNovaU1Model(const SenseNovaU1Config& config, bool generation_only = false)
             : config(config) {
             blocks["language_model.model"] = std::make_shared<TextModel>(config, generation_only);
-            if (!generation_only) {
-                blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config, GGML_TYPE_F32);
-            }
+            blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config, GGML_TYPE_F32);
             blocks["fm_modules.vision_model_mot_gen.embeddings"] = std::make_shared<VisionEmbeddings>(config, config.generation_compute_type);
             blocks["fm_modules.timestep_embedder"]               = std::make_shared<TimestepEmbedder>(config.hidden_size,
                                                                                                       config.timestep_embedding_size,
