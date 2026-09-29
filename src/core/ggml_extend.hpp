@@ -1722,6 +1722,7 @@ struct WeightAdapter {
         struct {
             bool force_prec_f32 = false;
             float scale         = 1.f;
+            ggml_type output_type = GGML_TYPE_F32;
         } linear;
         struct conv2d_params_t {
             int s0          = 1;
@@ -1734,6 +1735,7 @@ struct WeightAdapter {
             bool circular_x = false;
             bool circular_y = false;
             float scale     = 1.f;
+            ggml_type output_type = GGML_TYPE_F32;
         } conv2d;
     };
     virtual ggml_tensor* patch_weight(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* weight, const std::string& weight_name) = 0;
@@ -3564,11 +3566,15 @@ public:
                                                 b,
                                                 int8_convrot ? int8_convrot_group_size : 0,
                                                 scale);
+            if (out->type != output_type) {
+                out = ggml_cast(ctx->ggml_ctx, out, output_type);
+            }
             if (ctx->weight_adapter) {
                 WeightAdapter::ForwardParams forward_params;
                 forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
                 forward_params.linear.force_prec_f32 = force_prec_f32;
                 forward_params.linear.scale          = scale;
+                forward_params.linear.output_type    = output_type;
                 out                                  = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
                                                                                                ctx->backend,
                                                                                                lora_input,
@@ -3588,6 +3594,7 @@ public:
                 forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
                 forward_params.linear.force_prec_f32 = force_prec_f32;
                 forward_params.linear.scale          = scale;
+                forward_params.linear.output_type    = output_type;
                 out                                  = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
                                                                                                ctx->backend,
                                                                                                x,
@@ -3609,6 +3616,7 @@ public:
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;
             forward_params.linear.scale          = scale;
+            forward_params.linear.output_type    = output_type;
             out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
         } else {
             out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale, output_type);
@@ -3741,6 +3749,7 @@ public:
             forward_params.conv2d.circular_x = ctx->circular_x_enabled;
             forward_params.conv2d.circular_y = ctx->circular_y_enabled;
             forward_params.conv2d.scale      = scale;
+            forward_params.conv2d.output_type = output_type;
             return ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, b, prefix, forward_params);
         }
         return ggml_ext_conv_2d(ctx->ggml_ctx,
@@ -4199,9 +4208,14 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
     ggml_tensor* w2b,  // Inner B (Low rank part 2)
     bool is_conv,
     WeightAdapter::ForwardParams::conv2d_params_t conv_params,
-    float scale) {
+    float scale,
+    ggml_type output_type) {
     GGML_ASSERT((w1 != nullptr || (w1a != nullptr && w1b != nullptr)));
     GGML_ASSERT((w2 != nullptr || (w2a != nullptr && w2b != nullptr)));
+    GGML_ASSERT(output_type == GGML_TYPE_F32 || output_type == GGML_TYPE_F16);
+    if (output_type == GGML_TYPE_F16 && h->type != GGML_TYPE_F16) {
+        h = ggml_cast(ctx, h, GGML_TYPE_F16);
+    }
 
     int uq = (w1 != nullptr) ? (int)w1->ne[0] : (int)w1a->ne[0];
     int up = (w1 != nullptr) ? (int)w1->ne[1] : (int)w1b->ne[1];
@@ -4246,9 +4260,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
 
         ggml_tensor* h_split = ggml_reshape_3d(ctx, h, vq, uq * merge_batch_uq, batch / merge_batch_uq);
         if (w2 != nullptr) {
-            hb = ggml_mul_mat(ctx, w2, h_split);
+            hb = ggml_mul_mat_out_type(ctx, w2, h_split, output_type);
         } else {
-            hb = ggml_mul_mat(ctx, w2b, ggml_mul_mat(ctx, w2a, h_split));
+            hb = ggml_mul_mat_out_type(ctx, w2b, ggml_mul_mat_out_type(ctx, w2a, h_split, output_type), output_type);
         }
 
         if (batch > 1) {
@@ -4259,9 +4273,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
 
         ggml_tensor* hc_t;
         if (w1 != nullptr) {
-            hc_t = ggml_mul_mat(ctx, w1, hb_t);
+            hc_t = ggml_mul_mat_out_type(ctx, w1, hb_t, output_type);
         } else {
-            hc_t = ggml_mul_mat(ctx, w1b, ggml_mul_mat(ctx, w1a, hb_t));
+            hc_t = ggml_mul_mat_out_type(ctx, w1b, ggml_mul_mat_out_type(ctx, w1a, hb_t, output_type), output_type);
         }
 
         if (batch > 1) {
@@ -4287,7 +4301,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
                                   conv_params.direct,
                                   conv_params.circular_x,
                                   conv_params.circular_y,
-                                  conv_params.scale);
+                                  conv_params.scale,
+                                  output_type);
         } else {
             // swap a and b order for conv lora
             ggml_tensor* a = w2b;
@@ -4313,7 +4328,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
                                                conv_params.direct,
                                                conv_params.circular_x,
                                                conv_params.circular_y,
-                                               conv_params.scale);
+                                               conv_params.scale,
+                                               output_type);
 
             // not supporting lora_mid here
             hb = ggml_ext_conv_2d(ctx,
@@ -4329,7 +4345,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
                                   conv_params.direct,
                                   conv_params.circular_x,
                                   conv_params.circular_y,
-                                  conv_params.scale);
+                                  conv_params.scale,
+                                  output_type);
         }
 
         // Current hb shape: [W_out, H_out, vp, uq * batch]
@@ -4346,9 +4363,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_lokr_forward(
         ggml_tensor* hb_merged_t = ggml_cont(ctx, ggml_transpose(ctx, hb_merged));
         if (w1 != nullptr) {
             // Would be great to be able to transpose w1 instead to avoid transposing both hb and hc
-            hc_t = ggml_mul_mat(ctx, w1, hb_merged_t);
+            hc_t = ggml_mul_mat_out_type(ctx, w1, hb_merged_t, output_type);
         } else {
-            hc_t = ggml_mul_mat(ctx, w1b, ggml_mul_mat(ctx, w1a, hb_merged_t));
+            hc_t = ggml_mul_mat_out_type(ctx, w1b, ggml_mul_mat_out_type(ctx, w1a, hb_merged_t, output_type), output_type);
         }
         ggml_tensor* hc = ggml_transpose(ctx, hc_t);
         // ungroup
