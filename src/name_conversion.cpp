@@ -1349,6 +1349,15 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         return convert_esrgan_tensor_name(std::move(name));
     }
 
+    // BAGEL imports its understanding expert from a llama.cpp GGUF.  Those
+    // tensors already use the canonical llama.cpp names (token_embd, blk.*,
+    // ...), which Bagel::Model consumes directly.  The generic conditioner
+    // conversion below would translate them back to Hugging Face names and
+    // make the shared expert invisible to the diffusion runner.
+    if (version == VERSION_BAGEL && starts_with(name, "text_encoders.llm.")) {
+        return name;
+    }
+
     if (starts_with(name, "ip_adapter.") || starts_with(name, "image_proj.")) {
         return convert_ip_adapter_name(std::move(name), version);
     }

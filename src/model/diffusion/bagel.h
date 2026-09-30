@@ -280,7 +280,7 @@ struct Model : public GGMLBlock {
 
 struct Runner : public DiffusionModelRunner {
     Model model;
-    sd::Tensor<float> boundary_embeddings;
+    std::array<int32_t, 2> boundary_tokens{151652, 151653};
     std::array<int32_t, 3> next_positions{};
     std::array<std::vector<int32_t>, 3> prefix_tokens, prefix_positions;
     std::vector<ggml_tensor*> exported_keys, exported_values;
@@ -295,29 +295,6 @@ struct Runner : public DiffusionModelRunner {
         : DiffusionModelRunner(backend, "", manager) {
         model.init(params_ctx, storage);
         model.validate();
-        for (const auto& entry : model.understanding) {
-            const auto buffer_type = ggml_backend_buffer_get_type(entry.second->buffer);
-            if (!ggml_backend_dev_supports_buft(ggml_backend_get_device(backend), buffer_type)) {
-                throw std::invalid_argument("BAGEL shared understanding weights must be on the generation device: " + entry.first);
-            }
-        }
-        auto embedding = model.understood("token_embd.weight");
-        auto traits = ggml_get_type_traits(embedding->type);
-        if (embedding->type != GGML_TYPE_F32 && !traits->to_float) {
-            throw std::invalid_argument("Unsupported BAGEL token embedding type");
-        }
-        std::vector<float> values(2 * Model::hidden_size);
-        std::vector<uint8_t> row(ggml_row_size(embedding->type, Model::hidden_size));
-        // BAGEL-7B-MoT's vision_start and vision_end vocabulary rows.
-        for (int i = 0; i < 2; ++i) {
-            ggml_backend_tensor_get(embedding, row.data(), size_t(151652 + i) * row.size(), row.size());
-            if (embedding->type == GGML_TYPE_F32) {
-                std::memcpy(values.data() + i * Model::hidden_size, row.data(), row.size());
-            } else {
-                traits->to_float(row.data(), values.data() + i * Model::hidden_size, Model::hidden_size);
-            }
-        }
-        boundary_embeddings = sd::Tensor<float>({Model::hidden_size, 2}, std::move(values));
     }
 
     std::string get_desc() override { return "BAGEL-7B-MoT"; }
@@ -408,8 +385,11 @@ struct Runner : public DiffusionModelRunner {
         image_positions.assign(width * height + 2, next_positions[slot]);
         auto spatial = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, spatial_positions.size());
         auto positions = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, image_positions.size());
+        auto boundary_ids = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, boundary_tokens.size());
         set_backend_tensor_data(spatial, spatial_positions.data());
         set_backend_tensor_data(positions, image_positions.data());
+        set_backend_tensor_data(boundary_ids, boundary_tokens.data());
+        auto boundary_embeddings = ggml_get_rows(compute_ctx, model.understood("token_embd.weight"), boundary_ids);
         std::vector<ggml_tensor*> keys(Model::layers, nullptr), values(Model::layers, nullptr);
         if (prefix_lengths[slot]) {
             for (int layer = 0; layer < Model::layers; ++layer) {
@@ -419,7 +399,7 @@ struct Runner : public DiffusionModelRunner {
             }
         }
         auto run = get_context();
-        auto output = model.forward(&run, x, t, spatial, positions, make_input(boundary_embeddings), keys, values,
+        auto output = model.forward(&run, x, t, spatial, positions, boundary_embeddings, keys, values,
                                     export_prefix ? "bagel.prefix." + std::to_string(slot) + "." : "");
         ggml_build_forward_expand(gf, output);
         return gf;

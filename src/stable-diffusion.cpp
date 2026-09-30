@@ -2885,7 +2885,14 @@ public:
                 return {};
             }
 
-            if (!uncond.empty() && (!sd_version_is_bagel(version) || sigma > 0.4f)) {
+            // An imported BAGEL unconditional prefix may intentionally contain
+            // zero tokens.  Its SDCondition is therefore empty, but the active
+            // external slot still represents a valid denoising branch.
+            const bool has_uncond_condition = !uncond.empty() ||
+                                              (sd_version_is_bagel(version) &&
+                                               cfg_scale > 1.f &&
+                                               external_kv_conditions[1].active);
+            if (has_uncond_condition && (!sd_version_is_bagel(version) || sigma > 0.4f)) {
                 if (!step_cache.is_step_skipped()) {
                     compute_sample_controls(control_image,
                                             noised_input,
@@ -2908,7 +2915,11 @@ public:
                     return {};
                 }
             }
-            if (!img_uncond.empty() && (!sd_version_is_bagel(version) || sigma > 0.4f)) {
+            const bool has_img_uncond_condition = !img_uncond.empty() ||
+                                                  (sd_version_is_bagel(version) &&
+                                                   cfg_scale > 1.f && img_cfg_scale > 1.f &&
+                                                   external_kv_conditions[2].active);
+            if (has_img_uncond_condition && (!sd_version_is_bagel(version) || sigma > 0.4f)) {
                 img_uncond_out = run_condition(img_uncond,
                                                img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
                                                nullptr,
