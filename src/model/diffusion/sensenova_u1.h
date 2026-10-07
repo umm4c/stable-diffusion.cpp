@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -614,10 +615,14 @@ namespace SenseNovaU1 {
     struct SenseNovaU1Model : public GGMLBlock {
         SenseNovaU1Config config;
 
-        explicit SenseNovaU1Model(const SenseNovaU1Config& config, bool generation_only = false)
+        explicit SenseNovaU1Model(const SenseNovaU1Config& config,
+                                  bool generation_only = false,
+                                  bool has_understanding_vision = false)
             : config(config) {
             blocks["language_model.model"] = std::make_shared<TextModel>(config, generation_only);
-            blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config, GGML_TYPE_F32);
+            if (!generation_only || has_understanding_vision) {
+                blocks["vision_model.embeddings"] = std::make_shared<VisionEmbeddings>(config, GGML_TYPE_F32);
+            }
             blocks["fm_modules.vision_model_mot_gen.embeddings"] = std::make_shared<VisionEmbeddings>(config, config.generation_compute_type);
             blocks["fm_modules.timestep_embedder"]               = std::make_shared<TimestepEmbedder>(config.hidden_size,
                                                                                                       config.timestep_embedding_size,
@@ -639,7 +644,8 @@ namespace SenseNovaU1 {
         }
 
         std::shared_ptr<VisionEmbeddings> understanding_vision_embeddings() {
-            return std::dynamic_pointer_cast<VisionEmbeddings>(blocks["vision_model.embeddings"]);
+            auto it = blocks.find("vision_model.embeddings");
+            return it == blocks.end() ? nullptr : std::dynamic_pointer_cast<VisionEmbeddings>(it->second);
         }
 
         std::shared_ptr<TimestepEmbedder> timestep_embedder() {
@@ -659,6 +665,25 @@ namespace SenseNovaU1 {
     };
 
     struct SenseNovaU1Runner : public DiffusionModelRunner {
+        static bool has_understanding_vision_weights(const String2TensorStorage& weights,
+                                                     const std::string& prefix) {
+            const std::string root = prefix.empty() ? "" : prefix + ".";
+            const char* names[] = {
+                "vision_model.embeddings.patch_embedding.weight",
+                "vision_model.embeddings.patch_embedding.bias",
+                "vision_model.embeddings.dense_embedding.weight",
+                "vision_model.embeddings.dense_embedding.bias",
+            };
+            size_t count = 0;
+            for (const char* name : names) {
+                count += weights.count(root + name);
+            }
+            if (count != 0 && count != 4) {
+                throw std::runtime_error("Incomplete SenseNova U1 understanding vision weights");
+            }
+            return count == 4;
+        }
+
         SenseNovaU1Config config;
         SenseNovaU1Model model;
         bool external_prefix;
@@ -682,7 +707,7 @@ namespace SenseNovaU1 {
                           bool external_prefix = false)
             : DiffusionModelRunner(backend, prefix, weight_manager),
               config(SenseNovaU1Config::detect_from_weights(tensor_storage_map, prefix, backend)),
-              model(config, external_prefix),
+              model(config, external_prefix, has_understanding_vision_weights(tensor_storage_map, prefix)),
               external_prefix(external_prefix) {
             model.init(params_ctx, tensor_storage_map, prefix);
         }

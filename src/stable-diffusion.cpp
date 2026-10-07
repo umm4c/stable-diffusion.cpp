@@ -3993,7 +3993,8 @@ bool sd_encode_sensenova_u1_image(sd_ctx_t* sd_ctx, const sd_image_t* image,
         return false;
     }
     auto* runner = dynamic_cast<SenseNovaU1::SenseNovaU1Runner *>(sd.diffusion_model.get());
-    if (!runner) {
+    if (!runner || !runner->model.understanding_vision_embeddings()) {
+        LOG_ERROR("SenseNova U1 understanding vision encoder is unavailable in this model package");
         return false;
     }
     try {
