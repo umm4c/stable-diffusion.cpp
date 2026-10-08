@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <set>
 #include <type_traits>
 #include <unordered_set>
@@ -3993,7 +3994,8 @@ bool sd_encode_sensenova_u1_image(sd_ctx_t* sd_ctx, const sd_image_t* image,
         return false;
     }
     auto* runner = dynamic_cast<SenseNovaU1::SenseNovaU1Runner *>(sd.diffusion_model.get());
-    if (!runner) {
+    if (!runner || !runner->model.understanding_vision_embeddings()) {
+        LOG_ERROR("SenseNova U1 understanding vision encoder is unavailable in this model package");
         return false;
     }
     try {
@@ -4059,7 +4061,13 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         return nullptr;
     }
 
-    if (!sd_ctx->sd->init(sd_ctx_params)) {
+    bool initialized = false;
+    try {
+        initialized = sd_ctx->sd->init(sd_ctx_params);
+    } catch (const std::exception& error) {
+        LOG_ERROR("Failed to initialize model: %s", error.what());
+    }
+    if (!initialized) {
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
         free(sd_ctx);
