@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <set>
 #include <type_traits>
 #include <unordered_set>
@@ -4060,7 +4061,13 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         return nullptr;
     }
 
-    if (!sd_ctx->sd->init(sd_ctx_params)) {
+    bool initialized = false;
+    try {
+        initialized = sd_ctx->sd->init(sd_ctx_params);
+    } catch (const std::exception& error) {
+        LOG_ERROR("Failed to initialize model: %s", error.what());
+    }
+    if (!initialized) {
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
         free(sd_ctx);
