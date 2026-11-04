@@ -417,6 +417,18 @@ static ggml_backend_t init_named_backend(const std::string& name) {
     return ggml_backend_init_by_name(resolved.c_str(), nullptr);
 }
 
+bool sd_backend_uses_cann(ggml_backend_t backend) {
+    if (backend == nullptr) return false;
+    auto device = ggml_backend_get_device(backend);
+    if (device == nullptr) return false;
+    const std::string registry = ggml_backend_reg_name(ggml_backend_dev_backend_reg(device));
+    if (registry == "CANN") return true;
+    // RPC does not expose the worker backend family; the deployment pins this device to CANN.
+    const char* remote_cann = std::getenv("GGML_RPC_CANN_DEVICE");
+    return registry == "RPC" && remote_cann != nullptr &&
+           std::string(remote_cann) == ggml_backend_dev_name(device);
+}
+
 bool sd_backend_is_cpu(ggml_backend_t backend) {
     if (backend == nullptr) {
         return false;

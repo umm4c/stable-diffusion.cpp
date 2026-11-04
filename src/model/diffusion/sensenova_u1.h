@@ -92,8 +92,7 @@ namespace SenseNovaU1 {
                 config.num_layers = 42;
             }
             config.add_noise_scale_embedding = tensor_storage_map.find(root + "fm_modules.noise_scale_embedder.mlp.0.weight") != tensor_storage_map.end();
-            const std::string backend_name = backend != nullptr ? ggml_backend_name(backend) : "";
-            if (!starts_with(backend_name, "CANN")) {
+            if (!sd_backend_uses_cann(backend)) {
                 config.generation_compute_type = GGML_TYPE_F32;
             }
 
@@ -687,8 +686,6 @@ namespace SenseNovaU1 {
         SenseNovaU1Config config;
         SenseNovaU1Model model;
         bool external_prefix;
-        bool precision_audit_logged = false;
-        bool kv_precision_logged    = false;
         std::unordered_set<uint64_t> cached_prefix_hashes;
         std::map<uint64_t, std::string> imported_prefixes;
         std::map<uint64_t, int64_t> imported_prefix_lengths;
@@ -814,11 +811,6 @@ namespace SenseNovaU1 {
             };
             if (!GGMLRunner::compute<float>(get_graph, n_threads, false, true, true, true).has_value()) {
                 return false;
-            }
-            if (!kv_precision_logged) {
-                LOG_INFO("SenseNova U1.5 imported KV cache precision: %s",
-                         ggml_type_name(config.generation_compute_type));
-                kv_precision_logged = true;
             }
             for (auto it = imported_prefixes.begin(); it != imported_prefixes.end();) {
                 if (it->second == prefix) {
@@ -1053,63 +1045,13 @@ namespace SenseNovaU1 {
                                               ggml_sub(compute_ctx, x_prediction, x),
                                               1.f / denom);
             ggml_build_forward_expand(graph, velocity);
-            if (!precision_audit_logged) {
-                int mul_mat_f16 = 0;
-                int mul_mat_f32 = 0;
-                int im2col_f16  = 0;
-                int im2col_f32  = 0;
-                int norm_f32    = 0;
-                int softmax_f32 = 0;
-                int rope_f32    = 0;
-                int add_f16     = 0;
-                int add_f32     = 0;
-                int unary_f16   = 0;
-                int unary_f32   = 0;
+            if (config.generation_compute_type == GGML_TYPE_F16) {
                 for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                     const ggml_tensor* node = ggml_graph_node(graph, i);
-                    switch (node->op) {
-                        case GGML_OP_MUL_MAT:
-                            node->type == GGML_TYPE_F16 ? ++mul_mat_f16 : ++mul_mat_f32;
-                            break;
-                        case GGML_OP_IM2COL:
-                            node->type == GGML_TYPE_F16 ? ++im2col_f16 : ++im2col_f32;
-                            break;
-                        case GGML_OP_RMS_NORM:
-                            GGML_ASSERT(config.generation_compute_type != GGML_TYPE_F16 || node->type == GGML_TYPE_F32);
-                            norm_f32 += node->type == GGML_TYPE_F32;
-                            break;
-                        case GGML_OP_SOFT_MAX:
-                            GGML_ASSERT(config.generation_compute_type != GGML_TYPE_F16 || node->type == GGML_TYPE_F32);
-                            softmax_f32 += node->type == GGML_TYPE_F32;
-                            break;
-                        case GGML_OP_ROPE:
-                            GGML_ASSERT(config.generation_compute_type != GGML_TYPE_F16 || node->type == GGML_TYPE_F32);
-                            rope_f32 += node->type == GGML_TYPE_F32;
-                            break;
-                        case GGML_OP_ADD:
-                            node->type == GGML_TYPE_F16 ? ++add_f16 : ++add_f32;
-                            break;
-                        case GGML_OP_UNARY:
-                            node->type == GGML_TYPE_F16 ? ++unary_f16 : ++unary_f32;
-                            break;
-                        default:
-                            break;
+                    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_SOFT_MAX || node->op == GGML_OP_ROPE) {
+                        GGML_ASSERT(node->type == GGML_TYPE_F32);
                     }
                 }
-                LOG_INFO("SenseNova U1.5 precision audit: mul_mat f16=%d f32=%d, im2col f16=%d f32=%d, add f16=%d f32=%d, unary f16=%d f32=%d, rms_norm f32=%d, softmax f32=%d, rope f32=%d, sampler_output=%s",
-                         mul_mat_f16,
-                         mul_mat_f32,
-                         im2col_f16,
-                         im2col_f32,
-                         add_f16,
-                         add_f32,
-                         unary_f16,
-                         unary_f32,
-                         norm_f32,
-                         softmax_f32,
-                         rope_f32,
-                         ggml_type_name(velocity->type));
-                precision_audit_logged = true;
             }
             return graph;
         }
